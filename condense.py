@@ -13,10 +13,12 @@ from train import define_model, train_epoch
 from test import test_data, load_ckpt
 from misc.augment import DiffAug
 from misc import utils
+import math
 from math import ceil
 import glob
 from utils import get_strategy
 from data import Data
+from get_dp import get_noise_multiplier
 class Synthesizer():
     """Condensed data class
     """
@@ -400,6 +402,10 @@ def add_loss(loss_sum, loss):
 def matchloss(args, img_real, img_syn, lab_real, lab_syn, model):
     """Matching losses (feature or gradient)
     """
+    # max_grad_norm = 32.6355914473533 + 2 * (2.75161717041003 ** 0.5)
+    # noise_multiplier = 1.53076171875
+    max_grad_norm = args.max_grad_norm
+    noise_multiplier = args.sigma
     loss = None
     if args.match == 'feat':
         with torch.no_grad():
@@ -411,10 +417,38 @@ def matchloss(args, img_real, img_syn, lab_real, lab_syn, model):
     elif args.match == 'grad':
         criterion = nn.CrossEntropyLoss()
 
-        output_real = model(img_real)
-        loss_real = criterion(output_real, lab_real)
-        g_real = torch.autograd.grad(loss_real, model.parameters())
-        g_real = list((g.detach() for g in g_real))
+        # stat_a = []
+        if args.dp != 'none':
+            grads = []
+            for sample_img, sample_lab in zip(img_real, lab_real):
+                sample_out = model(sample_img.unsqueeze(0))
+                sample_loss = criterion(sample_out, sample_lab.unsqueeze(0))
+                sample_grad = torch.autograd.grad(sample_loss, model.parameters())  # need modify
+                sample_grad_flat = torch.cat([gr.data.view(-1) for gr in sample_grad])
+                clip_coef = max_grad_norm / (sample_grad_flat.data.norm(2) + 1e-7)
+                if clip_coef < 1:
+                    sample_grad_flat.mul_(clip_coef)
+                grads.append(sample_grad_flat)
+            grads = torch.stack(grads).mean(dim=0)
+            noise = torch.randn_like(grads) * noise_multiplier * max_grad_norm
+            grads = grads + noise
+
+            g_real = []
+            st, ed = 0, 0
+            for param in model.parameters():
+                ed = st + torch.numel(param)
+                g_real.append(grads[st: ed].reshape(param.shape).detach())
+                st = ed
+
+            # noise = torch.randn_like(g) * noise_multiplier
+            # stat_a.append(params.detach().norm().item())
+        #print(f'Part C, min: {np.min(stat_a)}, max: {np.max(stat_a)}, median: {np.median(stat_a)},'
+              #f'mean: {np.mean(stat_a)}, variance: {np.var(stat_a)}')
+        else:
+            output_real = model(img_real)
+            loss_real = criterion(output_real, lab_real)
+            g_real = torch.autograd.grad(loss_real, model.parameters())
+            g_real = list((g.detach() for g in g_real))
 
         output_syn = model(img_syn)
         loss_syn = criterion(output_syn, lab_syn)
@@ -452,6 +486,13 @@ def condense(args, logger, device='cuda'):
     """Optimize condensed data
     """
     # Define real dataset and loader
+    noise_multiplier = 0.
+    if args.dp != 'none':
+        args.sigma = get_noise_multiplier(target_epsilon=args.epsilon, target_delta=args.delta, sample_rate=args.sample_rate,
+                                     steps=args.dp_steps)
+        # args.sigma = 1. / args.epsilon * math.sqrt(2 * math.log(1.25 / args.delta))
+        print('DP steps: ', args.dp_steps)
+        print('Noise sigma: ', args.sigma)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     trainset, val_loader = load_resized_data(args)
     images_all = []
@@ -564,7 +605,7 @@ def condense(args, logger, device='cuda'):
     ts = utils.TimeStamp(args.time)
     n_iter = args.niter * 100 // args.inner_loop
     it_log = n_iter // 200
-    it_test = np.arange(0, n_iter+1, 40).tolist()
+    it_test = np.arange(0, n_iter+1, 10).tolist()
 
     logger(f"\nStart condensing with {args.match} matching for {n_iter} iteration")
     args.fix_iter = max(1, args.fix_iter)
@@ -594,6 +635,9 @@ def condense(args, logger, device='cuda'):
         loss_total = 0
         
         synset.data.data = torch.clamp(synset.data.data, min=0., max=1.)
+        #print('Gradient Part C batch_size: ', args.batch_real)
+        #print('Gradient Part C num_iter: ', args.inner_loop * n_iter)
+        hypergrad_ls = []
         for ot in range(args.inner_loop):
             ts.set()
             # Update synset
@@ -603,19 +647,33 @@ def condense(args, logger, device='cuda'):
                     query_index = strategy.query_match_sample(c,args.batch_real)
                     query_list[c] = query_index
                 img = images_all[query_list[c]]
+                assert img.size(0) == args.batch_real
                 lab = torch.tensor([np.ones(img.size(0))*c], dtype=torch.long, requires_grad=False, device=device).view(-1)
                 img_syn, lab_syn = synset.sample(c, max_size=args.batch_syn_max)
                 ts.stamp("data")
                 n = img.shape[0]
                 img_aug = aug(torch.cat([img, img_syn]))
                 ts.stamp("aug")
+                #print('Gradient Part B batch_size: ', lab_syn.shape)
+                #print('Gradient Part B num_iter: ', args.inner_loop * nclass)
                 loss = matchloss(args, img_aug[:n],  img_aug[n:], lab, lab_syn, model)
                 loss_total += loss.item()
                 ts.stamp("loss")
                 optim_img.zero_grad()
                 loss.backward()
+                """for grd in synset.data.grad.detach():
+                    hypergrad_ls.append(grd.detach().norm().item())
+
+                clip_coef = args.max_grad_norm / (synset.data.grad.data.norm(2) + 1e-7)
+                if clip_coef < 1:
+                    synset.data.grad.mul_(clip_coef)
+                synset.data.grad.add_(torch.randn_like(synset.data) * noise_multiplier) * max_grad_norm"""
+
                 optim_img.step()
                 ts.stamp("backward")
+            #print(
+                #f'Part B, min: {np.min(hypergrad_ls)}, max: {np.max(hypergrad_ls)}, median: {np.median(hypergrad_ls)},'
+                #f'mean: {np.mean(hypergrad_ls)}, variance: {np.var(hypergrad_ls)}')
             # Net update
             if args.n_data > 0:
                 for _ in range(args.net_epoch):
@@ -632,6 +690,7 @@ def condense(args, logger, device='cuda'):
             if (ot + 1) % 10 == 0:
                 ts.flush()
 
+        hypergrad_ls = []
         # Logging
         if it % it_log == 0:
             logger(

@@ -34,7 +34,7 @@ class Data:
         self.n_pool = len(X_train)
     
     def get_class_data(self,c):
-        idxs = torch.arange(self.n_pool)
+        idxs = torch.arange(self.n_pool).cuda()
         idxs_c=torch.where(self.Y_train[idxs]==c)
         idxs=idxs[idxs_c[0]]
         dst_train = Dataset(self.X_train[idxs], self.Y_train[idxs])
