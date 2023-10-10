@@ -404,8 +404,8 @@ def matchloss(args, img_real, img_syn, lab_real, lab_syn, model):
     """
     # max_grad_norm = 32.6355914473533 + 2 * (2.75161717041003 ** 0.5)
     # noise_multiplier = 1.53076171875
-    max_grad_norm = args.max_grad_norm
-    noise_multiplier = args.sigma
+    max_grad_norm = args.max_grad_norm_a
+    noise_multiplier = args.sigma_a
     loss = None
     if args.match == 'feat':
         with torch.no_grad():
@@ -417,21 +417,27 @@ def matchloss(args, img_real, img_syn, lab_real, lab_syn, model):
     elif args.match == 'grad':
         criterion = nn.CrossEntropyLoss()
 
-        # stat_a = []
-        if args.dp != 'none':
+        if args.dp_a or args.stat:
             grads = []
             for sample_img, sample_lab in zip(img_real, lab_real):
                 sample_out = model(sample_img.unsqueeze(0))
                 sample_loss = criterion(sample_out, sample_lab.unsqueeze(0))
                 sample_grad = torch.autograd.grad(sample_loss, model.parameters())  # need modify
                 sample_grad_flat = torch.cat([gr.data.view(-1) for gr in sample_grad])
-                clip_coef = max_grad_norm / (sample_grad_flat.data.norm(2) + 1e-7)
-                if clip_coef < 1:
-                    sample_grad_flat.mul_(clip_coef)
+                if args.dp_a:
+                    clip_coef = max_grad_norm / (sample_grad_flat.data.norm(2) + 1e-7)
+                    if clip_coef < 1:
+                        sample_grad_flat.mul_(clip_coef)
+
                 grads.append(sample_grad_flat)
             grads = torch.stack(grads).mean(dim=0)
-            noise = torch.randn_like(grads) * noise_multiplier * max_grad_norm
-            grads = grads + noise
+
+            if args.dp_a:
+                noise = torch.randn_like(grads) * noise_multiplier * max_grad_norm
+                grads = grads + noise
+            #else:
+                #print(f'Part A, min: {np.min(stat_a)}, max: {np.max(stat_a)}, median: {np.median(stat_a)},'
+                #f'mean: {np.mean(stat_a)}, variance: {np.var(stat_a)}')
 
             g_real = []
             st, ed = 0, 0
@@ -462,7 +468,10 @@ def matchloss(args, img_real, img_syn, lab_real, lab_syn, model):
 
             loss = add_loss(loss, dist(g_real[i], g_syn[i], method=args.metric))
 
-    return loss
+    if args.stat:
+        return loss, grads
+    else:
+        return loss
 
 
 def pretrain_sample(args, model, verbose=False):
@@ -486,13 +495,31 @@ def condense(args, logger, device='cuda'):
     """Optimize condensed data
     """
     # Define real dataset and loader
-    noise_multiplier = 0.
-    if args.dp != 'none':
-        args.sigma = get_noise_multiplier(target_epsilon=args.epsilon, target_delta=args.delta, sample_rate=args.sample_rate,
-                                     steps=args.dp_steps)
-        # args.sigma = 1. / args.epsilon * math.sqrt(2 * math.log(1.25 / args.delta))
+    if args.dp_a or args.dp_b:
+        sigma = get_noise_multiplier(target_epsilon=args.epsilon, target_delta=args.delta,
+                             sample_rate=args.sample_rate,
+                             steps=args.dp_steps)
         print('DP steps: ', args.dp_steps)
-        print('Noise sigma: ', args.sigma)
+        print('Noise sigma: ', sigma)
+
+        if args.dp_a:
+            if args.dp_b:
+                assert args.sigma_a and args.sigma_b, print("Currently does not support noise calculation in mixed mode, "
+                                                            "so they must be assigned as command line arguments")
+            else:
+                if not args.sigma_a:
+                    args.sigma_a = sigma
+        else:
+            if args.dp_b:
+                if not args.sigma_b:
+                    args.sigma_b = sigma
+
+    args.grad_accu_steps = 1
+    if args.dp_b or (args.dp_a and not args.dp_a_org) or args.stat:
+        # Set batch-size of real data to 1, and use gradient accumulation instead.
+        args.grad_accu_steps = args.batch_real
+        args.batch_real = 1
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     trainset, val_loader = load_resized_data(args)
     images_all = []
@@ -609,6 +636,7 @@ def condense(args, logger, device='cuda'):
 
     logger(f"\nStart condensing with {args.match} matching for {n_iter} iteration")
     args.fix_iter = max(1, args.fix_iter)
+    grads_accumulator = [[torch.zeros_like(param) for param in synset.parameters()] for c in range(nclass)]
     for it in range(n_iter):
         if it % args.fix_iter == 0 and it != 0:
             model = define_model(args, nclass).to(device)
@@ -637,8 +665,10 @@ def condense(args, logger, device='cuda'):
         synset.data.data = torch.clamp(synset.data.data, min=0., max=1.)
         #print('Gradient Part C batch_size: ', args.batch_real)
         #print('Gradient Part C num_iter: ', args.inner_loop * n_iter)
-        hypergrad_ls = []
+        stat_a_ls = []
+        stat_b_ls = []
         for ot in range(args.inner_loop):
+            step = it * args.inner_loop + ot
             ts.set()
             # Update synset
             for c in range(nclass):
@@ -656,26 +686,56 @@ def condense(args, logger, device='cuda'):
                 ts.stamp("aug")
                 #print('Gradient Part B batch_size: ', lab_syn.shape)
                 #print('Gradient Part B num_iter: ', args.inner_loop * nclass)
-                loss = matchloss(args, img_aug[:n],  img_aug[n:], lab, lab_syn, model)
+                if args.stat:
+                    loss, grads = matchloss(args, img_aug[:n], img_aug[n:], lab, lab_syn, model)
+                    stat_a_ls.append(grads.detach().norm().item())
+                else:
+                    loss = matchloss(args, img_aug[:n],  img_aug[n:], lab, lab_syn, model)
                 loss_total += loss.item()
                 ts.stamp("loss")
-                optim_img.zero_grad()
+                # optim_img.zero_grad()
                 loss.backward()
-                """for grd in synset.data.grad.detach():
-                    hypergrad_ls.append(grd.detach().norm().item())
 
+                #if args.dp_b:
+
+                """
                 clip_coef = args.max_grad_norm / (synset.data.grad.data.norm(2) + 1e-7)
                 if clip_coef < 1:
                     synset.data.grad.mul_(clip_coef)
                 synset.data.grad.add_(torch.randn_like(synset.data) * noise_multiplier) * max_grad_norm"""
+                if args.dp_b or (args.dp_a and not args.dp_a_org) or args.stat:
+                    with torch.no_grad():
+                        flatten_gd = torch.cat([g.grad.detach().clone().view(-1) for g in synset.parameters()])
+                        stat_b_ls.append(flatten_gd.detach().norm().item())
+                        if args.dp_b:
+                            clip_coef = args.max_grad_norm_b / (flatten_gd.data.norm(2) + 1e-7)
+                            if clip_coef < 1:
+                                for gd in synset.parameters():
+                                    gd.grad.mul_(clip_coef)
+                        for param, grad_accum in zip(synset.parameters(), grads_accumulator[c]):
+                            grad_accum.add_(param.grad.detach().clone() / args.grad_accu_steps)
+                    if (step + 1) % args.grad_accu_steps == 0:
+                        noise = torch.randn_like(flatten_gd) * args.sigma_b * args.max_grad_norm_b
+                        st = ed = 0
+                        with torch.no_grad():
+                            for param, grad_accum in zip(synset.parameters(), grads_accumulator[c]):
+                                ed = st + torch.numel(param)
+                                param.grad = grad_accum
+                                if args.dp_b:
+                                    param.grad.add_(noise[st: ed].reshape(param.shape))
+                                st = ed
+                        optim_img.step()
+                        grads_accumulator = [[torch.zeros_like(param) for param in synset.parameters()] for c in range(nclass)]
 
-                optim_img.step()
+                else:
+                    optim_img.step()
+                optim_img.zero_grad()
                 ts.stamp("backward")
             #print(
                 #f'Part B, min: {np.min(hypergrad_ls)}, max: {np.max(hypergrad_ls)}, median: {np.median(hypergrad_ls)},'
                 #f'mean: {np.mean(hypergrad_ls)}, variance: {np.var(hypergrad_ls)}')
             # Net update
-            if args.n_data > 0:
+            if (step + 1) % args.grad_accu_steps == 0 and args.n_data > 0:
                 for _ in range(args.net_epoch):
                     train_epoch(args,
                                 loader_real,
@@ -689,6 +749,13 @@ def condense(args, logger, device='cuda'):
 
             if (ot + 1) % 10 == 0:
                 ts.flush()
+        if args.stat:
+            print(f'Part A, min: {np.min(stat_a_ls)}, max: {np.max(stat_a_ls)}, median: {np.median(stat_a_ls)},'
+            f'mean: {np.mean(stat_a_ls)}, variance: {np.var(stat_a_ls)}')
+
+            print(
+                f'Part B, min: {np.min(stat_b_ls)}, max: {np.max(stat_b_ls)}, median: {np.median(stat_b_ls)},'
+                f'mean: {np.mean(stat_b_ls)}, variance: {np.var(stat_b_ls)}')
 
         hypergrad_ls = []
         # Logging

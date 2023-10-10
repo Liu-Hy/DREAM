@@ -258,12 +258,21 @@ parser.add_argument('--same_compute',
                     default=False,
                     help='match evaluation training steps for IDC')
 parser.add_argument('--name', type=str, default='', help='name of the test data folder')
-parser.add_argument('--dp', type=str, choices=['none', 'B', 'C'], default='none',
+parser.add_argument('--dp', type=str, choices=['none', 'A', 'B'], default='none',
                     help='Differential privacy setting. A is deprecated. B is questionable. C is preferable')
+parser.add_argument('--dp-a', action='store_true', help='whether to add noise to the first stage')
+parser.add_argument('--dp-a-org', action='store_true', help='if adding noise to the first stage, whether to do it in the original way')
+parser.add_argument('--dp-b', action='store_true', help='whether to add noise to the second stage')
+
+parser.add_argument('--sigma-a', type=float, default=0., help='noise magnitude for the first stage')
+parser.add_argument('--sigma-b', type=float, default=0., help='noise magnitude for the second stage')
+parser.add_argument('--max-grad-norm-a', type=float, default=1.0, help='parameter for differential privacy')
+parser.add_argument('--max-grad-norm-b', type=float, default=1.0, help='parameter for differential privacy')
+
 parser.add_argument('--stat', action='store_true', help='whether to compute statistics only')
 parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
 parser.add_argument('--delta', type=float, default=1e-5, help='parameter for differential privacy')
-parser.add_argument('--max-grad-norm', type=float, default=32.6355914473533 + 2 * (2.75161717041003 ** 0.5), help='parameter for differential privacy')
+# parser.add_argument('--max-grad-norm', type=float, default=32.6355914473533 + 2 * (2.75161717041003 ** 0.5), help='parameter for differential privacy')
 parser.add_argument('--sample-rate', type=float, default=1280 / 50000, help='parameter for differential privacy')
 parser.add_argument('--dp-steps', type=int, default=int(50000 / 1280 * 20), help='parameter for differential privacy')
 

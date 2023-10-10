@@ -15,21 +15,23 @@ class KMeansSampling(Strategy):
         return dist
 
     def query(self, c,n):
-        unlabeled_idxs, unlabeled_data = self.dataset.get_class_data(c)
-        embeddings = self.get_embeddings(unlabeled_data)
-        kmeans = KMeans(n_clusters=n, mode='euclidean', verbose=1)
-        labels = kmeans.fit_predict(embeddings)
-        centers = kmeans.centroids
-        dist_matrix = self.euclidean_dist(centers, embeddings)
-        q_idxs = unlabeled_idxs[torch.argmin(dist_matrix,dim=1)]
+        with torch.no_grad():
+            unlabeled_idxs, unlabeled_data = self.dataset.get_class_data(c)
+            embeddings = self.get_embeddings(unlabeled_data)
+            kmeans = KMeans(n_clusters=n, mode='euclidean', verbose=1)
+            labels = kmeans.fit_predict(embeddings)
+            centers = kmeans.centroids
+            dist_matrix = self.euclidean_dist(centers, embeddings)
+            q_idxs = unlabeled_idxs[torch.argmin(dist_matrix,dim=1)]
         return q_idxs
 
     def query_match_sample(self, c,n):
-        unlabeled_idxs, unlabeled_data = self.dataset.get_class_data(c)
-        embeddings = self.get_embeddings(unlabeled_data)
-        kmeans = KMeans(n_clusters=n, mode='euclidean')
-        labels = kmeans.fit_predict(embeddings)
-        centers = kmeans.centroids
-        dist_matrix = self.euclidean_dist(centers, embeddings)
-        q_idxs = unlabeled_idxs[torch.argmin(dist_matrix,dim=1)]
+        with torch.no_grad():
+            unlabeled_idxs, unlabeled_data = self.dataset.get_class_data(c)
+            embeddings = self.get_embeddings(unlabeled_data)
+            kmeans = KMeans(n_clusters=n, mode='euclidean')
+            labels = kmeans.fit_predict(embeddings)
+            centers = kmeans.centroids
+            dist_matrix = self.euclidean_dist(centers, embeddings)
+            q_idxs = unlabeled_idxs[torch.argmin(dist_matrix,dim=1)]
         return q_idxs
